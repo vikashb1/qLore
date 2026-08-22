@@ -1,0 +1,18 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+
+data/generated/
+data/raw/
+storage/
+
+# Airflow runtime files
+airflow/logs/
+*.log
+
+.vscode/
+.idea/
+
+.DS_Store
+Thumbs.db
