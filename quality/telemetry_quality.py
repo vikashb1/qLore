@@ -3,11 +3,16 @@ from datetime import datetime, timedelta
 import pandas as pd
 
 
+# ============================================================
+# qLore Telemetry Data Quality Rules
+# ============================================================
+
 REQUIRED_COLUMNS = [
     "device_id",
     "event_timestamp",
     "schema_version",
 ]
+
 
 VALID_STATUS_VALUES = {
     "HEALTHY",
@@ -16,11 +21,15 @@ VALID_STATUS_VALUES = {
 }
 
 
+# ============================================================
+# Required Column Check
+# ============================================================
+
 def check_required_columns(
     df: pd.DataFrame,
 ) -> list[str]:
     """
-    Verify required columns exist.
+    Verify that all required telemetry columns exist.
     """
 
     errors = []
@@ -32,6 +41,7 @@ def check_required_columns(
     ]
 
     if missing_columns:
+
         errors.append(
             f"Missing required columns: "
             f"{missing_columns}"
@@ -40,11 +50,15 @@ def check_required_columns(
     return errors
 
 
+# ============================================================
+# NOT NULL Check
+# ============================================================
+
 def check_not_null(
     df: pd.DataFrame,
 ) -> list[str]:
     """
-    Verify required fields do not contain NULL values.
+    Verify required telemetry fields do not contain NULLs.
     """
 
     errors = []
@@ -70,17 +84,25 @@ def check_not_null(
     return errors
 
 
+# ============================================================
+# Range Checks
+# ============================================================
+
 def check_ranges(
     df: pd.DataFrame,
 ) -> list[str]:
     """
-    Validate telemetry values fall within
+    Validate telemetry measurements against
     reasonable operating ranges.
+
+    These are qLore simulation boundaries,
+    not real quantum-hardware specifications.
     """
 
     errors = []
 
     range_rules = {
+
         "temperature_mk": (
             5,
             40,
@@ -147,17 +169,23 @@ def check_ranges(
             errors.append(
                 f"{column} has "
                 f"{invalid_count} values "
-                f"outside [{minimum}, {maximum}]."
+                f"outside "
+                f"[{minimum}, {maximum}]."
             )
 
     return errors
 
 
+# ============================================================
+# Status Check
+# ============================================================
+
 def check_status_values(
     df: pd.DataFrame,
 ) -> list[str]:
     """
-    Validate system_status values.
+    Validate system_status against the qLore
+    accepted status values.
     """
 
     errors = []
@@ -165,11 +193,19 @@ def check_status_values(
     if "system_status" not in df.columns:
         return errors
 
-    invalid_statuses = set(
+    statuses = (
         df[
             df["system_status"].notna()
         ]["system_status"]
-    ) - VALID_STATUS_VALUES
+        .astype(str)
+        .str.strip()
+        .str.upper()
+    )
+
+    invalid_statuses = (
+        set(statuses)
+        - VALID_STATUS_VALUES
+    )
 
     if invalid_statuses:
 
@@ -181,32 +217,73 @@ def check_status_values(
     return errors
 
 
+# ============================================================
+# Uniqueness Check
+# ============================================================
+
 def check_uniqueness(
     df: pd.DataFrame,
 ) -> list[str]:
     """
-    Kafka partition + offset should uniquely
-    identify each ingested Kafka record.
+    Verify telemetry events are logically unique.
+
+    IMPORTANT:
+
+    Kafka partition + offset are useful lineage fields,
+    but they are NOT treated as globally unique event IDs.
+
+    If a Kafka topic is recreated, partition offsets can
+    restart from zero.
+
+    qLore therefore identifies a telemetry event using:
+
+        device_id + event_timestamp
+
+    Example:
+
+        DEV002 + 2026-08-22T17:47:33...
+
+    represents one logical telemetry observation.
     """
 
     errors = []
 
     required = {
-        "kafka_partition",
-        "kafka_offset",
+        "device_id",
+        "event_timestamp",
     }
 
     if not required.issubset(
         df.columns
     ):
+
         return errors
 
+    working = df.copy()
+
+    # Normalize values before comparing them.
+    working["device_id"] = (
+        working["device_id"]
+        .astype(str)
+        .str.strip()
+        .str.upper()
+    )
+
+    working["event_timestamp"] = (
+        pd.to_datetime(
+            working["event_timestamp"],
+            errors="coerce",
+        )
+    )
+
     duplicate_count = (
-        df.duplicated(
+        working
+        .duplicated(
             subset=[
-                "kafka_partition",
-                "kafka_offset",
-            ]
+                "device_id",
+                "event_timestamp",
+            ],
+            keep="first",
         )
         .sum()
     )
@@ -215,35 +292,40 @@ def check_uniqueness(
 
         errors.append(
             f"Found {duplicate_count} duplicate "
-            f"Kafka partition/offset pairs."
+            f"telemetry events based on "
+            f"device_id + event_timestamp."
         )
 
     return errors
 
+
+# ============================================================
+# Freshness Check
+# ============================================================
 
 def check_freshness(
     df: pd.DataFrame,
     max_age_hours: int = 24,
 ) -> list[str]:
     """
-    Verify the newest telemetry event is recent.
+    Verify that telemetry contains a recent event.
 
-    We use 24 hours for the local development
-    environment so the check remains practical.
+    For local development we allow a 24-hour freshness
+    window so the project remains practical to run.
     """
 
     errors = []
 
-    if (
-        "event_timestamp"
-        not in df.columns
-    ):
+    if "event_timestamp" not in df.columns:
+
         return errors
 
     if df.empty:
+
         errors.append(
             "Telemetry dataset is empty."
         )
+
         return errors
 
     timestamps = pd.to_datetime(
@@ -284,37 +366,49 @@ def check_freshness(
     return errors
 
 
+# ============================================================
+# Main Quality Runner
+# ============================================================
+
 def run_telemetry_quality_checks(
     df: pd.DataFrame,
 ) -> dict:
     """
-    Run all qLore Bronze telemetry
-    data-quality checks.
+    Run all qLore Bronze telemetry data-quality checks.
+
+    Returns a structured dictionary containing
+    individual check results and an overall result.
     """
 
     all_errors = []
 
     checks = [
+
         (
             "required_columns",
             check_required_columns,
         ),
+
         (
             "not_null",
             check_not_null,
         ),
+
         (
             "ranges",
             check_ranges,
         ),
+
         (
             "status_values",
             check_status_values,
         ),
+
         (
             "uniqueness",
             check_uniqueness,
         ),
+
         (
             "freshness",
             check_freshness,
@@ -328,8 +422,10 @@ def run_telemetry_quality_checks(
         check_function,
     ) in checks:
 
-        errors = check_function(
-            df
+        errors = (
+            check_function(
+                df
+            )
         )
 
         passed = (
@@ -339,15 +435,22 @@ def run_telemetry_quality_checks(
         results[
             check_name
         ] = {
-            "passed": passed,
-            "errors": errors,
+
+            "passed":
+                passed,
+
+            "errors":
+                errors,
         }
 
         all_errors.extend(
             errors
         )
 
-    results["overall"] = {
+    results[
+        "overall"
+    ] = {
+
         "passed":
             len(all_errors) == 0,
 

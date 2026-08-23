@@ -12,15 +12,20 @@ from pyiceberg.catalog import load_catalog
 
 def get_catalog():
     """
-    Connect to the qLore Iceberg REST catalog.
+    Connect to qLore Iceberg.
 
-    Local Windows execution:
-        QLORE_CATALOG_URI defaults to localhost:8181
-        QLORE_S3_ENDPOINT defaults to localhost:9000
+    Local Windows execution defaults to:
 
-    Docker / Airflow execution:
-        QLORE_CATALOG_URI = http://iceberg-rest:8181
-        QLORE_S3_ENDPOINT = http://minio:9000
+        Iceberg REST:
+        http://localhost:8181
+
+        MinIO:
+        http://localhost:9000
+
+    Airflow running inside Docker receives:
+
+        QLORE_CATALOG_URI=http://iceberg-rest:8181
+        QLORE_S3_ENDPOINT=http://minio:9000
     """
 
     catalog_uri = os.getenv(
@@ -39,22 +44,41 @@ def get_catalog():
         uri=catalog_uri,
         warehouse="s3://warehouse",
         **{
-            "s3.endpoint": s3_endpoint,
-            "s3.access-key-id": "admin",
-            "s3.secret-access-key": "password",
-            "s3.region": "us-east-1",
-            "s3.path-style-access": "true",
+            "s3.endpoint":
+                s3_endpoint,
+
+            "s3.access-key-id":
+                "admin",
+
+            "s3.secret-access-key":
+                "password",
+
+            "s3.region":
+                "us-east-1",
+
+            "s3.path-style-access":
+                "true",
         },
     )
 
 
 # ============================================================
-# Bronze Cleaning
+# Clean Bronze
 # ============================================================
 
 def clean_bronze_telemetry(
     df: pd.DataFrame,
 ) -> pd.DataFrame:
+    """
+    Standardize and clean Bronze telemetry.
+
+    Event identity is:
+
+        device_id + event_timestamp
+
+    Kafka partition and offset remain as lineage
+    attributes, but are not used for deduplication.
+    """
 
     print(
         f"\nBronze rows received: "
@@ -70,39 +94,61 @@ def clean_bronze_telemetry(
     cleaned[
         "event_timestamp"
     ] = pd.to_datetime(
-        cleaned["event_timestamp"],
+        cleaned[
+            "event_timestamp"
+        ],
         errors="coerce",
     )
 
     cleaned[
         "ingested_at"
     ] = pd.to_datetime(
-        cleaned["ingested_at"],
+        cleaned[
+            "ingested_at"
+        ],
         errors="coerce",
     )
 
     # --------------------------------------------------------
-    # Remove invalid required fields
+    # Required fields
     # --------------------------------------------------------
 
-    cleaned = cleaned.dropna(
-        subset=[
-            "device_id",
-            "event_timestamp",
-            "schema_version",
-            "kafka_partition",
-            "kafka_offset",
-        ]
+    before_required = len(
+        cleaned
+    )
+
+    cleaned = (
+        cleaned
+        .dropna(
+            subset=[
+                "device_id",
+                "event_timestamp",
+                "schema_version",
+            ]
+        )
+    )
+
+    removed_missing = (
+        before_required
+        - len(cleaned)
+    )
+
+    print(
+        f"Rows removed for missing "
+        f"required fields: "
+        f"{removed_missing}"
     )
 
     # --------------------------------------------------------
-    # Standardize text
+    # Text standardization
     # --------------------------------------------------------
 
     cleaned[
         "device_id"
     ] = (
-        cleaned["device_id"]
+        cleaned[
+            "device_id"
+        ]
         .astype(str)
         .str.strip()
         .str.upper()
@@ -111,7 +157,9 @@ def clean_bronze_telemetry(
     cleaned[
         "system_status"
     ] = (
-        cleaned["system_status"]
+        cleaned[
+            "system_status"
+        ]
         .astype(str)
         .str.strip()
         .str.upper()
@@ -120,14 +168,32 @@ def clean_bronze_telemetry(
     cleaned[
         "schema_version"
     ] = (
-        cleaned["schema_version"]
+        cleaned[
+            "schema_version"
+        ]
         .astype(str)
         .str.strip()
         .str.lower()
     )
 
     # --------------------------------------------------------
-    # Remove duplicates within Bronze
+    # Logical event deduplication
+    # --------------------------------------------------------
+    #
+    # IMPORTANT:
+    #
+    # We used to deduplicate on:
+    #
+    #     kafka_partition + kafka_offset
+    #
+    # That is incorrect across Kafka topic recreation
+    # because offsets can restart from zero.
+    #
+    # qLore now uses:
+    #
+    #     device_id + event_timestamp
+    #
+    # as the logical telemetry identity.
     # --------------------------------------------------------
 
     before_dedup = len(
@@ -138,25 +204,26 @@ def clean_bronze_telemetry(
         cleaned
         .drop_duplicates(
             subset=[
-                "kafka_partition",
-                "kafka_offset",
+                "device_id",
+                "event_timestamp",
             ],
             keep="last",
         )
     )
 
-    duplicate_count = (
+    duplicates_removed = (
         before_dedup
         - len(cleaned)
     )
 
     print(
-        f"Duplicates removed inside "
-        f"Bronze batch: {duplicate_count}"
+        f"Logical duplicate events removed "
+        f"inside Bronze: "
+        f"{duplicates_removed}"
     )
 
     # --------------------------------------------------------
-    # Validate status
+    # Status validation
     # --------------------------------------------------------
 
     valid_statuses = {
@@ -165,16 +232,32 @@ def clean_bronze_telemetry(
         "CRITICAL",
     }
 
-    cleaned = cleaned[
+    before_status = len(
+        cleaned
+    )
+
+    cleaned = (
         cleaned[
-            "system_status"
-        ].isin(
-            valid_statuses
-        )
-    ]
+            cleaned[
+                "system_status"
+            ].isin(
+                valid_statuses
+            )
+        ]
+    )
+
+    invalid_status_removed = (
+        before_status
+        - len(cleaned)
+    )
+
+    print(
+        f"Rows removed for invalid status: "
+        f"{invalid_status_removed}"
+    )
 
     # --------------------------------------------------------
-    # Sort deterministically
+    # Deterministic ordering
     # --------------------------------------------------------
 
     cleaned = (
@@ -190,11 +273,16 @@ def clean_bronze_telemetry(
         )
     )
 
+    print(
+        f"Clean Bronze rows available: "
+        f"{len(cleaned)}"
+    )
+
     return cleaned
 
 
 # ============================================================
-# Idempotency
+# Incremental / Idempotent Processing
 # ============================================================
 
 def remove_already_processed_records(
@@ -202,52 +290,140 @@ def remove_already_processed_records(
     silver_df: pd.DataFrame,
 ) -> pd.DataFrame:
     """
-    Prevent duplicate Silver writes.
+    Prevent Bronze -> Silver duplication.
 
-    Kafka partition + offset uniquely identify
-    each record within the source topic.
+    A logical telemetry event is identified by:
+
+        device_id + event_timestamp
+
+    kafka_partition + kafka_offset are retained
+    strictly for lineage/debugging.
+
+    This allows the pipeline to remain idempotent
+    even if Kafka is recreated and offsets restart.
     """
 
     if silver_df.empty:
 
         print(
-            "\nSilver is empty. "
-            "All Bronze records are new."
+            "\nSilver is empty."
+        )
+
+        print(
+            f"All {len(bronze_df)} "
+            f"clean Bronze rows are new."
         )
 
         return bronze_df
 
+    bronze_working = (
+        bronze_df.copy()
+    )
+
+    silver_working = (
+        silver_df.copy()
+    )
+
+    # Normalize timestamps on both sides before comparison.
+
+    bronze_working[
+        "event_timestamp"
+    ] = pd.to_datetime(
+        bronze_working[
+            "event_timestamp"
+        ],
+        errors="coerce",
+    )
+
+    silver_working[
+        "event_timestamp"
+    ] = pd.to_datetime(
+        silver_working[
+            "event_timestamp"
+        ],
+        errors="coerce",
+    )
+
+    bronze_working[
+        "device_id"
+    ] = (
+        bronze_working[
+            "device_id"
+        ]
+        .astype(str)
+        .str.strip()
+        .str.upper()
+    )
+
+    silver_working[
+        "device_id"
+    ] = (
+        silver_working[
+            "device_id"
+        ]
+        .astype(str)
+        .str.strip()
+        .str.upper()
+    )
+
+    # --------------------------------------------------------
+    # Build already-processed logical event keys
+    # --------------------------------------------------------
+
     processed_keys = set(
         zip(
-            silver_df[
-                "kafka_partition"
+            silver_working[
+                "device_id"
             ],
-            silver_df[
-                "kafka_offset"
+
+            silver_working[
+                "event_timestamp"
             ],
         )
     )
 
-    is_new = bronze_df.apply(
-        lambda row: (
-            row["kafka_partition"],
-            row["kafka_offset"],
+    # --------------------------------------------------------
+    # Identify unseen logical events
+    # --------------------------------------------------------
+
+    is_new = (
+        bronze_working
+        .apply(
+            lambda row: (
+                row[
+                    "device_id"
+                ],
+                row[
+                    "event_timestamp"
+                ],
+            )
+            not in processed_keys,
+
+            axis=1,
         )
-        not in processed_keys,
-        axis=1,
     )
 
-    new_df = bronze_df[
-        is_new
-    ].copy()
+    new_df = (
+        bronze_working[
+            is_new
+        ]
+        .copy()
+    )
 
-    print(
-        f"\nAlready processed rows skipped: "
-        f"{len(bronze_df) - len(new_df)}"
+    skipped_count = (
+        len(bronze_working)
+        - len(new_df)
     )
 
     print(
-        f"New rows for Silver: "
+        f"\nAlready processed "
+        f"telemetry events skipped: "
+        f"{skipped_count}"
+    )
+
+    print(
+        f"New telemetry events "
+        f"for Silver: "
         f"{len(new_df)}"
     )
 
@@ -255,15 +431,20 @@ def remove_already_processed_records(
 
 
 # ============================================================
-# Pandas → Arrow
+# Pandas → PyArrow
 # ============================================================
 
 def dataframe_to_arrow(
     df: pd.DataFrame,
 ) -> pa.Table:
+    """
+    Convert cleaned Silver DataFrame into the
+    exact PyArrow schema expected by Iceberg.
+    """
 
     schema = pa.schema(
         [
+
             pa.field(
                 "device_id",
                 pa.string(),
@@ -332,6 +513,8 @@ def dataframe_to_arrow(
                 pa.timestamp("us"),
             ),
 
+            # Kafka fields remain because they provide
+            # useful source lineage.
             pa.field(
                 "kafka_partition",
                 pa.int32(),
@@ -362,7 +545,7 @@ def dataframe_to_arrow(
 
 
 # ============================================================
-# Main Transformation
+# Main Bronze → Silver Pipeline
 # ============================================================
 
 def main():
@@ -373,19 +556,27 @@ def main():
 
     print("=" * 70)
 
+    # --------------------------------------------------------
+    # Connect to Iceberg
+    # --------------------------------------------------------
+
     catalog = get_catalog()
 
-    bronze_table = catalog.load_table(
-        (
-            "bronze",
-            "telemetry",
+    bronze_table = (
+        catalog.load_table(
+            (
+                "bronze",
+                "telemetry",
+            )
         )
     )
 
-    silver_table = catalog.load_table(
-        (
-            "silver",
-            "telemetry",
+    silver_table = (
+        catalog.load_table(
+            (
+                "silver",
+                "telemetry",
+            )
         )
     )
 
@@ -404,10 +595,15 @@ def main():
         .to_pandas()
     )
 
+    print(
+        f"Current Bronze rows: "
+        f"{len(bronze_df)}"
+    )
+
     if bronze_df.empty:
 
         print(
-            "No Bronze data found."
+            "\nNo Bronze data found."
         )
 
         return
@@ -422,9 +618,22 @@ def main():
         )
     )
 
+    if cleaned_df.empty:
+
+        print(
+            "\nNo valid Bronze records "
+            "remain after cleaning."
+        )
+
+        return
+
     # --------------------------------------------------------
-    # Read Silver
+    # Read current Silver
     # --------------------------------------------------------
+
+    print(
+        "\nReading silver.telemetry..."
+    )
 
     silver_df = (
         silver_table
@@ -434,12 +643,12 @@ def main():
     )
 
     print(
-        f"\nCurrent Silver rows: "
+        f"Current Silver rows: "
         f"{len(silver_df)}"
     )
 
     # --------------------------------------------------------
-    # Keep only unseen Kafka records
+    # Determine incremental records
     # --------------------------------------------------------
 
     new_rows = (
@@ -448,6 +657,10 @@ def main():
             silver_df,
         )
     )
+
+    # --------------------------------------------------------
+    # No-op if Silver is already current
+    # --------------------------------------------------------
 
     if new_rows.empty:
 
@@ -462,7 +675,7 @@ def main():
         return
 
     # --------------------------------------------------------
-    # Write Silver
+    # Convert to Arrow
     # --------------------------------------------------------
 
     arrow_table = (
@@ -470,6 +683,10 @@ def main():
             new_rows
         )
     )
+
+    # --------------------------------------------------------
+    # Append only unseen logical events
+    # --------------------------------------------------------
 
     silver_table.append(
         arrow_table
