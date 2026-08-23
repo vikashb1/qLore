@@ -1,6 +1,35 @@
 services:
 
   # =========================================================
+  # TRINO
+  # =========================================================
+
+  trino:
+    image: trinodb/trino:483
+    container_name: qlore-trino
+
+    ports:
+      - "8081:8080"
+
+    volumes:
+      - ./trino/etc:/etc/trino
+      - qlore-trino-data:/data/trino
+
+    depends_on:
+      iceberg-rest:
+        condition: service_started
+
+      minio:
+        condition: service_started
+
+      qlore-postgres:
+        condition: service_healthy
+
+    networks:
+      - qlore-network
+
+
+  # =========================================================
   # KAFKA
   # =========================================================
 
@@ -108,6 +137,37 @@ services:
 
 
   # =========================================================
+  # QLORE POSTGRESQL
+  # =========================================================
+
+  qlore-postgres:
+    image: postgres:16
+    container_name: qlore-postgres
+
+    ports:
+      - "5433:5432"
+
+    environment:
+      POSTGRES_USER: qlore
+      POSTGRES_PASSWORD: qlore
+      POSTGRES_DB: qlore
+
+    volumes:
+      - qlore-postgres-data:/var/lib/postgresql/data
+
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U qlore -d qlore
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+    networks:
+      - qlore-network
+
+
+  # =========================================================
   # AIRFLOW DATABASE
   # =========================================================
 
@@ -157,7 +217,6 @@ services:
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
       AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS: "true"
       AIRFLOW__API_AUTH__JWT_SECRET: qlore-local-development-secret
-
       AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/execution/
 
       PYTHONPATH: /opt/airflow/qlore
@@ -201,7 +260,6 @@ services:
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
       AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS: "true"
       AIRFLOW__API_AUTH__JWT_SECRET: qlore-local-development-secret
-
       AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/execution/
 
       PYTHONPATH: /opt/airflow/qlore
@@ -248,7 +306,6 @@ services:
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
       AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS: "true"
       AIRFLOW__API_AUTH__JWT_SECRET: qlore-local-development-secret
-
       AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/execution/
 
       PYTHONPATH: /opt/airflow/qlore
@@ -292,7 +349,6 @@ services:
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
       AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS: "true"
       AIRFLOW__API_AUTH__JWT_SECRET: qlore-local-development-secret
-
       AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/execution/
 
       PYTHONPATH: /opt/airflow/qlore
@@ -324,6 +380,10 @@ volumes:
   qlore-iceberg-catalog:
 
   qlore-airflow-db-data:
+
+  qlore-trino-data:
+
+  qlore-postgres-data:
 
 
 # ===========================================================
